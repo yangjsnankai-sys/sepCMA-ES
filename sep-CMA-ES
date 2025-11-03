@@ -7,7 +7,7 @@ function sep()
 %% —— Global Parameters (Adjustable as needed) ——
 GLOBAL_SEED    = 20251204;   % Fixed random seed for reproducibility
 N_REPEAT       = 5;          % Number of repetitions per unique height (median for noise reduction)
-MODEL          = 'parafoil2';% Corresponding Simulink name
+MODEL          = 'parafoil_CMA';% Corresponding Simulink name
 Tf             = 500;        % Simulation duration
 STEP           = 0.2;        % Height quantization step
 LB             = 3.0;        % Lower bound
