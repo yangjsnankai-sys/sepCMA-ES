@@ -1,0 +1,281 @@
+function sep()
+% ================== Parafoil Height Optimization: sep-CMA-ES + Hybrid (Single Simulation + Visualization) ==================
+% Model: parafoil2.slx
+% Tunable workspace variable: height_action (scalar)
+% Objective: Maximize episodeReward (therefore take negative in objective function)
+
+%% —— Global Parameters (Adjustable as needed) ——
+GLOBAL_SEED    = 20251204;   % Fixed random seed for reproducibility
+N_REPEAT       = 5;          % Number of repetitions per unique height (median for noise reduction)
+MODEL          = 'parafoil2';% Corresponding Simulink name
+Tf             = 500;        % Simulation duration
+STEP           = 0.2;        % Height quantization step
+LB             = 3.0;        % Lower bound
+UB             = 20.0;       % Upper bound
+
+% CMA-ES Initialization (1-dimensional)
+x0      = 12.0;
+sigma0  = (UB-LB)/4;
+lambda  = 12;
+maxEval = 200;
+
+%% —— Open Model & Parallel Pool —— 
+if ~bdIsLoaded(MODEL), load_system(MODEL); end
+p = gcp('nocreate'); if isempty(p), parpool('local'); end
+
+tStart = tic;
+
+% Worker-side path isolation
+pctRunOnAll( ...
+    "cf = tempname; gf = tempname; " + ...
+    "Simulink.fileGenControl('set','CacheFolder',cf,'CodeGenFolder',gf,'createDir',true);" + ...
+    "warning('off','Simulink:cache:CacheFileWriteError');" ...
+);
+
+
+% Fixed randomness: main/workers; disable multithreaded BLAS to reduce floating-point jitter
+rng(GLOBAL_SEED,'twister');
+pctRunOnAll( ...
+    "try, s = RandStream('Threefry','Seed'," + GLOBAL_SEED + "+ labindex); " + ...
+    "RandStream.setGlobalStream(s); " + ...
+    "maxNumCompThreads(1); " + ...
+    "end" ...
+);
+
+% Avoid parallel cleanup conflicts, bdclose('all') will be called on worker side before batch evaluation
+set_param(MODEL,'FastRestart','on');
+
+%% —— Context & Cache —— 
+ctx.model   = MODEL;
+ctx.Tf      = Tf;
+ctx.step    = STEP;
+ctx.lb      = LB;
+ctx.ub      = UB;
+ctx.nrepeat = N_REPEAT;
+ctx.seedR   = GLOBAL_SEED;
+
+persistent CACHE;
+CACHE = containers.Map();   % Reset each run to avoid cross-run contamination
+ctx.cache = CACHE;
+
+%% —— sep-CMA-ES Main Loop (Diagonal Covariance) ——
+n=1; mu=floor(lambda/2);
+w = log(mu + 0.5) - log(1:mu)';  w = w/sum(w);
+mueff = 1/sum(w.^2);
+cs = (mueff + 2) / (n + mueff + 5);
+ds = 1 + cs + 2*max(0, sqrt((mueff-1)/(n+1)) - 1);
+cc = (4 + mueff/n) / (n + 4 + 2*mueff/n);
+c1 = 2 / ((n+1.3)^2 + mueff);
+cmu = min(1 - c1, 2*(mueff-2+1/mueff)/((n+2)^2 + mueff));
+chiN = 0.857;
+
+m = x0; D = 1; ps = 0; pc = 0; sigma = sigma0;
+neval = 0; fbest = inf; xbest = m; history = [];
+
+while neval < maxEval
+    % Sampling
+    Z = randn(1, lambda);
+    X = clip01D(m + sigma * sqrt(D) .* Z, LB, UB);
+
+    % Evaluate one generation
+    f = eval_population(X, ctx);
+    neval = neval + numel(X);
+
+    % Recombination/Update
+    [f, idx] = sort(f); X = X(idx);
+    xsel = X(1:mu);
+    m_old = m; m = sum(xsel .* w');
+    y = (m - m_old)/sigma;
+
+    ps = (1 - cs)*ps + sqrt(cs*(2 - cs)*mueff) * (y/sqrt(D));
+    sigma = sigma * exp((cs/ds)*(abs(ps)/chiN - 1));
+
+    hsig = double( abs(ps)/sqrt(1 - (1-cs)^(2*length(history)+2)) < (1.4 + 2/(n+1))*chiN );
+    pc = (1 - cc)*pc + hsig * sqrt(cc*(2-cc)*mueff) * y;
+
+    D = (1 - c1 - cmu) * D + c1 * (pc.^2);
+    Y = (xsel - m_old)/sigma;
+    D = max( (D + cmu * sum((Y.^2) .* w')), 1e-20 );
+
+    if f(1) < fbest, fbest=f(1); xbest=X(1); end
+    history(end+1) = fbest; %#ok<AGROW>
+
+    if sigma * sqrt(D) < 1e-6*(UB-LB), break; end
+end
+
+best_h = quantize_clip(xbest, STEP, LB, UB);
+fprintf('=== sep-CMA-ES Finished: x≈%.3f (quantized→%.1f), f≈%.6f, evaluations=%d ===\n', xbest, best_h, fbest, neval);
+
+%% —— Hybrid Local Optimization (using median objective) ——
+delta = max(0.5, 2*sigma); a = max(LB, xbest - delta); b = min(UB, xbest + delta);
+obj_local = @(x) obj_h(x, ctx);  % Uses median internally
+
+fprintf('[%s] >>> Hybrid fminbnd START\n', datestr(now,'HH:MM:SS.FFF'));
+opts_fmb = optimset('TolX',0.02,'Display','iter');   % Show iteration table
+[x_loc, f_loc] = fminbnd(obj_local, a, b, opts_fmb);
+best_h2 = quantize_clip(x_loc, STEP, LB, UB);
+
+%% —— Single Run: Programmatic Simulation, but View Results in Simulink Interface —— 
+% Open model (ensure Scope/Display will refresh in real-time)
+open_system(MODEL);
+set_param(MODEL,'FastRestart','off');
+
+% This is the "only one" final simulation; Display/Scope will refresh in the open model window
+simIn = Simulink.SimulationInput(MODEL);
+simIn = simIn.setVariable('height_action', best_h2);
+simIn = simIn.setVariable('seedR', ctx.seedR);
+simIn = simIn.setModelParameter('StopTime', num2str(Tf), ...
+                                'SignalLogging','on', 'SignalLoggingName','logsout');
+simout = sim(simIn);
+
+% Read reward (only this metric, removed error fallback)
+R = get_reward(simout);   % Must be readable, otherwise error
+episodeReward = R;        % Positive reward (larger is better)
+
+% Write current best height to Base workspace for subsequent manual operations/reruns (no automatic second simulation)
+assignin('base','height_action',best_h2);
+assignin('base','seedR',ctx.seedR);
+
+%% —— Summary and Saving —— 
+out.simout        = simout;
+out.best_h        = best_h2;
+out.fbest         = f_loc;          % Optimization objective (smaller is better)
+out.best_reward   = episodeReward;  % Human readable: best reward (larger is better)
+out.history       = history;
+
+save('sep_out.mat','out');   % Archive results
+
+tElapsed = toc(tStart);
+fprintf('\n[TIME] Total elapsed time: %.1f s\n', tElapsed);
+end
+
+% ========================= Subfunctions =========================
+function f = eval_population(X, ctx)
+    % One generation: quantize→deduplicate→evaluate N_REPEAT times→median→cache→backfill
+    Xq = arrayfun(@(x) quantize_clip(x, ctx.step, ctx.lb, ctx.ub), X);
+    [uniq_h, ~, ic] = unique(Xq, 'stable');
+
+    sims = Simulink.SimulationInput.empty(0,1);
+    need = false(size(uniq_h));
+    for i = 1:numel(uniq_h)
+        key = sprintf('h=%.1f', uniq_h(i));
+        if ~isKey(ctx.cache, key)
+            need(i) = true;
+            for k = 1:ctx.nrepeat
+                si = Simulink.SimulationInput(ctx.model);
+                si = si.setVariable('height_action', uniq_h(i));
+                si = si.setVariable('seedR', ctx.seedR);
+                si = si.setModelParameter('StopTime', num2str(ctx.Tf), ...
+                                          'SignalLogging','on', ...
+                                          'SignalLoggingName','logsout');
+                sims(end+1,1) = si; %#ok<AGROW>
+            end
+        end
+    end
+
+    if isempty(sims)
+        % All in cache, directly backfill
+    elseif isscalar(sims)
+        % Single: serial sim
+        tmp = sim(sims);
+        V = -get_reward(tmp);
+        ctx.cache(sprintf('h=%.1f', uniq_h(need))) = struct('mean', V, 'cnt', ctx.nrepeat);
+    else
+        % Multiple: parallel
+        % pctRunOnAll("try, bdclose('all'); clear mex; maxNumCompThreads(1);, end");
+        out = parsim(sims, ...
+            'ShowProgress','off', ...
+            'TransferBaseWorkspaceVariables','off', ...
+            'StopOnError','on', ...
+            'UseFastRestart','off');
+        pos = 1;
+        for i = 1:numel(uniq_h)
+            if ~need(i), continue; end
+            V = NaN(ctx.nrepeat,1);
+            for k = 1:ctx.nrepeat
+                V(k) = -get_reward(out(pos));
+                pos = pos + 1;
+            end
+            ctx.cache(sprintf('h=%.1f', uniq_h(i))) = struct('mean', median(V,'omitnan'), 'cnt', ctx.nrepeat);
+        end
+    end
+
+    % Backfill f
+    f = NaN(size(X));
+    for j = 1:numel(X)
+        key = sprintf('h=%.1f', Xq(j));
+        rec = ctx.cache(key);
+        f(j) = rec.mean;
+    end
+end
+
+function fj = obj_h(x, ctx)
+    % Local objective: quantize→return if cache hit; otherwise evaluate N_REPEAT times (median)
+    h = quantize_clip(x, ctx.step, ctx.lb, ctx.ub);
+    key = sprintf('h=%.1f', h);
+    if isKey(ctx.cache, key), fj = ctx.cache(key).mean; return; end
+
+    sims(ctx.nrepeat,1) = Simulink.SimulationInput(ctx.model);
+    for k = 1:ctx.nrepeat
+        si = Simulink.SimulationInput(ctx.model);
+        si = si.setVariable('height_action', h);
+        si = si.setVariable('seedR', ctx.seedR);
+        si = si.setModelParameter('StopTime', num2str(ctx.Tf), ...
+                                  'SignalLogging','on', ...
+                                  'SignalLoggingName','logsout');
+        sims(k) = si;
+    end
+
+    if isscalar(sims)
+        o = sim(sims);
+        vals = -get_reward(o);
+    else
+        % pctRunOnAll("try, bdclose('all'); clear mex; maxNumCompThreads(1);, end");
+        out = parsim(sims, ...
+            'ShowProgress','off', ...
+            'TransferBaseWorkspaceVariables','off', ...
+            'StopOnError','on', ...
+            'UseFastRestart','off');
+        vals = NaN(ctx.nrepeat,1);
+        for k = 1:ctx.nrepeat
+            vals(k) = -get_reward(out(k));
+        end
+        vals = median(vals,'omitnan');
+    end
+    fj = vals;
+    ctx.cache(key) = struct('mean', fj, 'cnt', ctx.nrepeat);
+end
+
+function r = get_reward(simOut)
+    % Read only episodeReward; error if cannot read
+    ok = false; r = NaN;
+    try
+        ws = simOut.who;
+        if any(strcmp(ws,'episodeReward'))
+            v = simOut.get('episodeReward');
+            if isa(v,'timeseries'), v = v.Data(end); end
+            r = v; ok = isfinite(r);
+        end
+    catch, end
+    if ~ok
+        try
+            ds = simOut.logsout;
+            if ~isempty(ds)
+                el = ds.get('episodeReward');
+                v = el.Values; r = v.Data(end); ok = isfinite(r);
+            end
+        catch, end
+    end
+    if ~ok
+        error('Failed to read episodeReward from simulation results. Please check model signal logging settings.');
+    end
+end
+
+function xq = quantize_clip(x, step, lb, ub)
+    xq = lb + ceil((x - lb)/step)*step;
+    xq = min(max(xq, lb), ub);
+end
+
+function X = clip01D(X, lb, ub)
+    X = max(min(X, ub), lb);
+end
